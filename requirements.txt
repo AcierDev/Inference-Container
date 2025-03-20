@@ -1,0 +1,2 @@
+Flask==2.3.3
+inference  # Replace with the specific inference library you are using
