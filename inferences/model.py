@@ -39,6 +39,50 @@ def get_onnx_session(model_path):
 
 # Model path - update this to point to your YOLOv8s ONNX file
 MODEL_PATH = os.environ.get("YOLOV8_MODEL_PATH", "models/yolov8s.onnx")
+# Path to custom class names file
+CLASS_NAMES_FILE = os.environ.get("YOLOV8_CLASS_FILE", "models/classes.txt")
+
+# YOLOv8 class names - COCO classes by default
+# Can be customized based on your specific model's classes
+YOLOV8_CLASSES = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+    "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+    "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+    "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+    "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator",
+    "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
+]
+
+# Define classes to treat as "damage" for our use case
+# This allows you to map certain detected objects to "damage" category
+DAMAGE_CLASSES = ["crack", "hole", "stain", "dent", "scratch", "tear", "split"]
+
+# The class name to use if we're using our own custom model with a single class
+DEFAULT_CLASS_NAME = "damage"
+
+# Try to load custom class names if file exists
+def load_class_names(file_path):
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, 'r') as f:
+                class_names = [line.strip() for line in f.readlines() if line.strip()]
+                logger.info(f"Loaded {len(class_names)} custom class names from {file_path}")
+                return class_names
+    except Exception as e:
+        logger.error(f"Error loading class names from {file_path}: {str(e)}")
+    return None
+
+# Load custom class names if available
+custom_classes = load_class_names(CLASS_NAMES_FILE)
+if custom_classes:
+    YOLOV8_CLASSES = custom_classes
+    logger.info(f"Using custom classes: {YOLOV8_CLASSES}")
+else:
+    logger.info(f"Using default COCO classes. Create {CLASS_NAMES_FILE} for custom classes.")
 
 # Initialize the ONNX session
 try:
@@ -130,19 +174,23 @@ def process_yolov8_output(outputs, img_width, img_height, conf_threshold=0.25, i
     scores = []
     class_ids = []
 
+    # Apply sigmoid activation function
+    def sigmoid(x):
+        return 1 / (1 + np.exp(-x))
+    
     # Process each detection
     for i in range(output.shape[1]):
         # Extract box coordinates and dimensions
         x, y, w, h = output[0, i, 0:4]
         
-        # Calculate confidence scores (objectness)
-        confidence = float(output[0, i, 4])
+        # Calculate confidence scores (objectness) - apply sigmoid!
+        confidence = sigmoid(float(output[0, i, 4]))
         
         if confidence < conf_threshold:
             continue
             
-        # Get class scores (5th element onwards)
-        class_scores = output[0, i, 5:]
+        # Get class scores (5th element onwards) - apply sigmoid!
+        class_scores = sigmoid(output[0, i, 5:])
         class_id = np.argmax(class_scores)
         class_score = float(class_scores[class_id])
         
@@ -173,6 +221,17 @@ def process_yolov8_output(outputs, img_width, img_height, conf_threshold=0.25, i
             w *= img_width
             h *= img_height
         
+        # Get class name based on class id
+        class_id = class_ids[i]
+        # Use COCO class names if available and within range
+        if class_id < len(YOLOV8_CLASSES):
+            class_name = YOLOV8_CLASSES[class_id]
+            # Map specific classes to "damage" for this application
+            if class_name in DAMAGE_CLASSES:
+                class_name = "damage"
+        else:
+            class_name = DEFAULT_CLASS_NAME  # Default to "damage" for our use case
+        
         # Create detection object
         detection = {
             'x': float(x),
@@ -181,7 +240,7 @@ def process_yolov8_output(outputs, img_width, img_height, conf_threshold=0.25, i
             'height': float(h),
             'confidence': float(scores[i]),
             'class_id': int(class_ids[i]),
-            'class_name': f"damage",  # Replace with actual class names if available
+            'class_name': class_name,
             'detection_id': detection_id
         }
         
@@ -231,8 +290,8 @@ def process_image(image_path):
         logger.info(f"Running inference with input shape: {input_data.shape}")
         outputs = model.run(output_names, {input_name: input_data})
         
-        # Process outputs to get detections
-        predictions = process_yolov8_output(outputs, img_width, img_height)
+        # Process outputs to get detections - using appropriate confidence threshold
+        predictions = process_yolov8_output(outputs, img_width, img_height, conf_threshold=0.4, iou_threshold=0.45)
         logger.info(f"Found {len(predictions)} detections")
         
         # Prepare serialized results
