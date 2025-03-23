@@ -1,2 +1,6 @@
 Flask==2.3.3
-inference  # Replace with the specific inference library you are using
+numpy>=1.20.0
+Pillow>=9.0.0
+opencv-python>=4.5.0
+onnxruntime-gpu>=1.13.1
+ultralytics>=8.0.0  # For YOLOv8s model

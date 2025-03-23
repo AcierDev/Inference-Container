@@ -1,25 +1,63 @@
 # model.py
-import inference
 import logging
 import numpy as np
 from PIL import Image
-
 import os
+import cv2
 import onnxruntime as ort
+import time
 
-# Set thread options explicitly to avoid affinity issues
-os.environ["OMP_NUM_THREADS"] = "4"  # Adjust based on available cores
-os.environ["OMP_WAIT_POLICY"] = "ACTIVE"
-
-# Configure session options (compatible approach)
-session_options = ort.SessionOptions()
-session_options.intra_op_num_threads = 4
-session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-
-# Load the model during module import
-model = inference.get_model("yolo-nas-hi-res/6")
+# Configure logger
 logger = logging.getLogger(__name__)
+
+# Set up ONNX Runtime session with GPU acceleration
+def get_onnx_session(model_path):
+    """
+    Create an ONNX Runtime session with GPU acceleration if available
+    """
+    # Check if GPU is available and set providers accordingly
+    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] 
+    
+    try:
+        # Create ONNX Runtime session
+        session = ort.InferenceSession(model_path, providers=providers)
+        
+        # Log which provider is being used
+        provider_name = session.get_providers()[0]
+        logger.info(f"Using {provider_name} for inference")
+        return session
+    except Exception as e:
+        logger.error(f"Error creating ONNX session: {str(e)}")
+        # Fall back to CPU if there's an error with GPU
+        try:
+            logger.warning("Falling back to CPU execution")
+            session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+            return session
+        except Exception as e2:
+            logger.error(f"Error creating CPU ONNX session: {str(e2)}")
+            raise RuntimeError(f"Failed to initialize ONNX Runtime: {str(e2)}")
+
+# Model path - update this to point to your YOLOv8s ONNX file
+MODEL_PATH = os.environ.get("YOLOV8_MODEL_PATH", "models/yolov8s.onnx")
+
+# Initialize the ONNX session
+try:
+    model = get_onnx_session(MODEL_PATH)
+    logger.info(f"Successfully loaded YOLOv8s model from {MODEL_PATH}")
+    
+    # Get model metadata
+    inputs = model.get_inputs()
+    input_name = inputs[0].name
+    input_shape = inputs[0].shape
+    logger.info(f"Model input shape: {input_shape}")
+    
+    outputs = model.get_outputs()
+    output_names = [output.name for output in outputs]
+    logger.info(f"Model output names: {output_names}")
+    
+except Exception as e:
+    logger.error(f"Failed to load YOLOv8s model: {str(e)}")
+    raise RuntimeError(f"Model initialization failed: {str(e)}")
 
 def get_image_dimensions(image_path):
     """Get actual image dimensions"""
@@ -77,81 +115,183 @@ def normalize_coordinates(x, y, width, height, img_width, img_height):
     
     return [x1, y1, x2, y2]
 
+def process_yolov8_output(outputs, img_width, img_height, conf_threshold=0.25, iou_threshold=0.45):
+    """
+    Process YOLOv8 ONNX model output to get bounding boxes, classes and scores
+    """
+    predictions = []
+    
+    # YOLOv8 output is (batch, 84, num_boxes) where 84 is 4 box coordinates + 80 class scores
+    # Extract the output data
+    output = outputs[0]
+    
+    # Get number of detections
+    boxes = []
+    scores = []
+    class_ids = []
+
+    # Process each detection
+    for i in range(output.shape[1]):
+        # Extract box coordinates and dimensions
+        x, y, w, h = output[0, i, 0:4]
+        
+        # Calculate confidence scores (objectness)
+        confidence = float(output[0, i, 4])
+        
+        if confidence < conf_threshold:
+            continue
+            
+        # Get class scores (5th element onwards)
+        class_scores = output[0, i, 5:]
+        class_id = np.argmax(class_scores)
+        class_score = float(class_scores[class_id])
+        
+        # Combine objectness with class confidence
+        score = confidence * class_score
+        
+        if score < conf_threshold:
+            continue
+            
+        # Add to our lists
+        boxes.append([x, y, w, h])
+        scores.append(score)
+        class_ids.append(class_id)
+    
+    # Apply non-maximum suppression
+    indices = cv2.dnn.NMSBoxes(boxes, scores, conf_threshold, iou_threshold)
+    
+    # Process final detections
+    detection_id = 0
+    for i in indices:
+        # Get the box coordinates
+        x, y, w, h = boxes[i]
+        
+        # Convert from normalized coordinates to actual coordinates if needed
+        if x <= 1 and y <= 1 and w <= 1 and h <= 1:
+            x *= img_width
+            y *= img_height
+            w *= img_width
+            h *= img_height
+        
+        # Create detection object
+        detection = {
+            'x': float(x),
+            'y': float(y),
+            'width': float(w),
+            'height': float(h),
+            'confidence': float(scores[i]),
+            'class_id': int(class_ids[i]),
+            'class_name': f"damage",  # Replace with actual class names if available
+            'detection_id': detection_id
+        }
+        
+        detection_id += 1
+        predictions.append(detection)
+    
+    return predictions
+
 def process_image(image_path):
     """
-    Processes an image to detect wood imperfections.
+    Processes an image to detect wood imperfections using YOLOv8s.
     :param image_path: Path to the image file.
     :return: JSON-serializable inference results
     """
     logger.info(f"Running inference on image {image_path}")
+    start_time = time.time()
     
     # Get actual image dimensions
     img_width, img_height = get_image_dimensions(image_path)
     logger.info(f"Image dimensions: {img_width}x{img_height}")
     
-    # Run inference
-    results = model.infer(image=image_path)
-    logger.info(f"Inference complete for {image_path}")
-
     try:
+        # Load and preprocess the image
+        img = cv2.imread(str(image_path))
+        if img is None:
+            raise RuntimeError(f"Could not load image {image_path}")
+            
+        # Convert BGR to RGB
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Get model input shape
+        input_shape = model.get_inputs()[0].shape
+        input_height, input_width = input_shape[2], input_shape[3]
+        
+        # Resize and normalize image
+        resized = cv2.resize(img, (input_width, input_height))
+        input_data = resized.astype(np.float32) / 255.0  # Normalize to [0,1]
+        
+        # Change shape from HWC to NCHW format (batch, channels, height, width)
+        input_data = input_data.transpose(2, 0, 1)
+        input_data = np.expand_dims(input_data, axis=0)
+        
+        # Run inference
+        input_name = model.get_inputs()[0].name
+        output_names = [output.name for output in model.get_outputs()]
+        
+        logger.info(f"Running inference with input shape: {input_data.shape}")
+        outputs = model.run(output_names, {input_name: input_data})
+        
+        # Process outputs to get detections
+        predictions = process_yolov8_output(outputs, img_width, img_height)
+        logger.info(f"Found {len(predictions)} detections")
+        
+        # Prepare serialized results
         serialized_results = {
             "predictions": []
         }
-
+        
         # Process each detection
-        for result in results:
-            if hasattr(result, 'predictions'):
-                for prediction in result.predictions:
-                    try:
-                        # Get base prediction attributes
-                        x = float(getattr(prediction, 'x', 0))
-                        y = float(getattr(prediction, 'y', 0))
-                        width = float(getattr(prediction, 'width', 0))
-                        height = float(getattr(prediction, 'height', 0))
-                        
-                        # Skip invalid detections
-                        if width <= 0 or height <= 0:
-                            logger.warning(f"Skipping detection with invalid dimensions: {width}x{height}")
-                            continue
-                            
-                        # Check if detection is within image bounds
-                        if x + width/2 > img_width or y + height/2 > img_height:
-                            logger.warning(
-                                f"Detection at ({x},{y}) with size {width}x{height} "
-                                f"extends beyond image bounds {img_width}x{img_height}"
-                            )
-                        
-                        # Normalize coordinates with edge handling
-                        bbox = normalize_coordinates(x, y, width, height, img_width, img_height)
-                        
-                        # Calculate normalized dimensions
-                        bbox_width = bbox[2] - bbox[0]
-                        bbox_height = bbox[3] - bbox[1]
-                        bbox_area = bbox_width * bbox_height
-                        
-                        # Skip if normalization resulted in invalid box
-                        if bbox_area <= 0:
-                            logger.warning(f"Skipping detection with zero area after normalization")
-                            continue
-                        
-                        serialized_prediction = {
-                            'class_name': getattr(prediction, 'class_name', 'damage'),
-                            'confidence': float(getattr(prediction, 'confidence', 0.0)),
-                            'detection_id': getattr(prediction, 'detection_id', None),
-                            'bbox': bbox
-                        }
-                        
-                        logger.debug(f"Processed prediction: {serialized_prediction}")
-                        serialized_results["predictions"].append(serialized_prediction)
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing individual prediction: {str(e)}", exc_info=True)
-                        continue
-            else:
-                logger.warning("Result object does not contain 'predictions' attribute")
-
+        for prediction in predictions:
+            try:
+                # Get base prediction attributes
+                x = float(prediction['x'])
+                y = float(prediction['y'])
+                width = float(prediction['width']) 
+                height = float(prediction['height'])
+                
+                # Skip invalid detections
+                if width <= 0 or height <= 0:
+                    logger.warning(f"Skipping detection with invalid dimensions: {width}x{height}")
+                    continue
+                    
+                # Check if detection is within image bounds
+                if x + width/2 > img_width or y + height/2 > img_height:
+                    logger.warning(
+                        f"Detection at ({x},{y}) with size {width}x{height} "
+                        f"extends beyond image bounds {img_width}x{img_height}"
+                    )
+                
+                # Normalize coordinates with edge handling
+                bbox = normalize_coordinates(x, y, width, height, img_width, img_height)
+                
+                # Calculate normalized dimensions
+                bbox_width = bbox[2] - bbox[0]
+                bbox_height = bbox[3] - bbox[1]
+                bbox_area = bbox_width * bbox_height
+                
+                # Skip if normalization resulted in invalid box
+                if bbox_area <= 0:
+                    logger.warning(f"Skipping detection with zero area after normalization")
+                    continue
+                
+                serialized_prediction = {
+                    'class_name': prediction['class_name'],
+                    'confidence': prediction['confidence'],
+                    'detection_id': prediction['detection_id'],
+                    'bbox': bbox
+                }
+                
+                logger.debug(f"Processed prediction: {serialized_prediction}")
+                serialized_results["predictions"].append(serialized_prediction)
+                
+            except Exception as e:
+                logger.error(f"Error processing individual prediction: {str(e)}", exc_info=True)
+                continue
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"Inference completed in {elapsed_time:.2f} seconds")
         return serialized_results
 
     except Exception as e:
-        logger.error(f"Error serializing results: {str(e)}", exc_info=True)
-        raise RuntimeError(f"Failed to process prediction results: {str(e)}")
+        logger.error(f"Error during inference: {str(e)}", exc_info=True)
+        raise RuntimeError(f"Failed to process image: {str(e)}")
