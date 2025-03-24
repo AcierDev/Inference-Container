@@ -102,3 +102,7 @@ logs/
 .Trashes
 ehthumbs.db
 Thumbs.db 
+
+myenv/
+venv/
+storage/
