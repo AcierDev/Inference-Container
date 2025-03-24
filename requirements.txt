@@ -2,5 +2,6 @@ Flask==2.3.3
 numpy>=1.20.0
 Pillow>=9.0.0
 opencv-python>=4.5.0
-onnxruntime-gpu>=1.13.1
-ultralytics>=8.0.0  # For YOLOv8s model
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics>=8.0.0  # For YOLOv8 model
