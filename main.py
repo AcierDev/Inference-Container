@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 from PIL import Image, ImageDraw, ImageFont
 import colorsys
+import concurrent.futures
 
 # Local imports
 from inferences.model import process_image
@@ -56,10 +57,19 @@ log_dir.mkdir(exist_ok=True)
 
 logging.basicConfig(
     filename=str(log_dir / 'app.log'),
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Create a thread pool for background tasks
+background_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+# Dictionary to track background tasks
+background_tasks = {}
+
+# Define a maximum number of tasks to keep in memory
+MAX_TASK_HISTORY = 100
 
 def create_annotated_image(image_path: Path, result: dict) -> Path:
     """
@@ -235,6 +245,7 @@ def organize_processed_image(file_path: Path, result: dict) -> dict:
         
         # Delete original upload after copying to all relevant directories
         file_path.unlink()
+        
         logger.info(f"Organized image into {len(organized_paths['defect_types']) + (1 if organized_paths['count_based'] else 0)} directories")
         
         return organized_paths
@@ -250,6 +261,55 @@ def organize_processed_image(file_path: Path, result: dict) -> dict:
             'annotated': None, 
             'original': file_path
         }
+
+def organize_processed_image_async(file_path: Path, result: dict, task_id: str):
+    """
+    Background task to organize processed images.
+    This function will be called in a separate thread.
+    """
+    background_tasks[task_id] = {
+        "status": "running",
+        "start_time": datetime.now().isoformat(),
+        "file_path": str(file_path),
+        "task_type": "file_organization"
+    }
+    
+    try:
+        organized_paths = organize_processed_image(file_path, result)
+        
+        background_tasks[task_id].update({
+            "status": "completed",
+            "end_time": datetime.now().isoformat(),
+            "success": True,
+            "paths": {
+                "defect_types": [str(p) for p in organized_paths['defect_types']],
+                "count_based": str(organized_paths['count_based']) if organized_paths['count_based'] else None,
+                "annotated": str(organized_paths['annotated']) if organized_paths['annotated'] else None
+            }
+        })
+        logger.info(f"Background task {task_id}: Completed file organization")
+        return organized_paths
+    except Exception as e:
+        error_msg = f"Background task {task_id}: Error organizing file {file_path}: {str(e)}"
+        logger.error(error_msg)
+        
+        background_tasks[task_id].update({
+            "status": "failed",
+            "end_time": datetime.now().isoformat(),
+            "error": str(e),
+            "success": False
+        })
+        
+        # Move to failed directory if organization fails
+        try:
+            failed_path = DEFECT_DIRS['failed'] / file_path.name
+            shutil.move(str(file_path), str(failed_path))
+            background_tasks[task_id]["moved_to_failed"] = str(failed_path)
+        except Exception as move_error:
+            logger.error(f"Background task {task_id}: Error moving file to failed directory: {str(move_error)}")
+            background_tasks[task_id]["move_error"] = str(move_error)
+        
+        return None
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -268,6 +328,15 @@ def health_check():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "storage": storage_info
+    })
+
+@app.route('/background-tasks', methods=['GET'])
+def get_background_tasks():
+    """Endpoint to check the status of background tasks"""
+    return jsonify({
+        "success": True,
+        "task_count": len(background_tasks),
+        "tasks": background_tasks
     })
 
 @app.route('/detect-imperfection', methods=['POST'])
@@ -302,33 +371,32 @@ def detect_imperfection():
             filename = f"{timestamp}_{secure_fname}"
             upload_path = UPLOAD_DIR / filename
             
-            # Save the file
+            # Save file
             file.save(str(upload_path))
             logger.info(f"File saved at {upload_path}")
             
             try:
-                # Process the image
+                # Process image
                 result = process_image(str(upload_path))
                 
-                # Organize the file based on results
-                organized_paths = organize_processed_image(upload_path, result)
+                # Generate a unique task ID for the background task
+                task_id = f"task_{timestamp}_{hash(filename) % 10000:04d}"
                 
-                # Add file location info to result
-                result['file_info'] = {
-                    'original_filename': file.filename,
-                    'stored_locations': {
-                        'defect_types': [str(p) for p in organized_paths['defect_types']],
-                        'count_based': str(organized_paths['count_based']) if organized_paths['count_based'] else None
-                    }
-                }
+                # Schedule file organization to run in background
+                background_executor.submit(organize_processed_image_async, upload_path, result, task_id)
                 
-                logger.info(f"Successfully processed and organized {filename}")
-                
-                return jsonify({
+                # Prepare the response with task ID
+                response_data = {
                     "success": True,
                     "data": result,
-                    "timestamp": datetime.now().isoformat()
-                }), 200
+                    "timestamp": datetime.now().isoformat(),
+                    "message": "Processing complete. File organization running in background.",
+                    "background_task_id": task_id
+                }
+                
+                logger.info(f"File organization for {filename} scheduled as background task {task_id}")
+                
+                return jsonify(response_data), 200
                 
             except Exception as e:
                 error_msg = f"Error processing {filename}: {str(e)}"
@@ -411,34 +479,58 @@ def cleanup_old_files(max_age_hours=24):
         # Archive old files from failed processing directory
         archive_old_files(DEFECT_DIRS['failed'])
         
-        # Optional: Clean up old archives
-        # Uncomment and modify if you want to permanently delete very old archived files
-        """
-        for file_path in ARCHIVE_DIR.glob('**/*'):
-            if not file_path.is_file():
-                continue
-                
-            file_age = current_time - datetime.fromtimestamp(file_path.stat().st_mtime)
-            if file_age.total_seconds() > (max_age_hours * 2 * 3600):  # Double the retention for archives
-                try:
-                    file_path.unlink()
-                    logger.info(f"Removed old archive: {file_path}")
-                except Exception as e:
-                    logger.error(f"Error removing old archive {file_path}: {str(e)}")
-        """
-        
     except Exception as e:
         logger.error(f"Error during cleanup: {str(e)}")
+
+def cleanup_old_task_history():
+    """Remove old tasks from the history to prevent memory leaks"""
+    if len(background_tasks) > MAX_TASK_HISTORY:
+        # Get tasks sorted by completion time (oldest first)
+        sorted_tasks = sorted(
+            background_tasks.items(),
+            key=lambda x: x[1].get('end_time', x[1].get('start_time', '')),
+            reverse=False
+        )
+        # Remove oldest tasks
+        tasks_to_remove = len(background_tasks) - MAX_TASK_HISTORY
+        for i in range(tasks_to_remove):
+            if i < len(sorted_tasks):
+                task_id = sorted_tasks[i][0]
+                del background_tasks[task_id]
+        logger.info(f"Cleaned up {tasks_to_remove} old background tasks from history")
 
 def start_cleanup_scheduler():
     """Start the periodic cleanup of old files"""
     def cleanup_schedule():
+        """Clean up old files and task history"""
         while True:
-            cleanup_old_files()
-            threading.Event().wait(3600)  # Run every hour
+            try:
+                logger.info("Running scheduled cleanup...")
+                cleanup_old_files()
+                cleanup_old_task_history()
+                threading.Event().wait(3600)  # Run every hour
+            except Exception as e:
+                logger.error(f"Error in cleanup schedule: {str(e)}")
+                threading.Event().wait(3600)  # Wait and try again
     
     cleanup_thread = threading.Thread(target=cleanup_schedule, daemon=True)
     cleanup_thread.start()
+
+# Add a function to gracefully shut down the thread pool
+def shutdown_executor():
+    """Shutdown the background thread pool gracefully"""
+    logger.info("Shutting down background task executor...")
+    background_executor.shutdown(wait=True)
+    
+    # Clear the background tasks dictionary to free memory
+    background_tasks.clear()
+    logger.info("Cleared background task history")
+    
+    logger.info("Background task executor shut down successfully")
+
+# Register the shutdown function to run when Flask exits
+import atexit
+atexit.register(shutdown_executor)
 
 if __name__ == '__main__':
     try:

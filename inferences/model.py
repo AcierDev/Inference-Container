@@ -4,7 +4,6 @@ import numpy as np
 from PIL import Image
 import os
 import cv2
-import time
 import torch
 from ultralytics import YOLO
 
@@ -25,21 +24,17 @@ def get_device():
     return device
 
 # Model path - update this to point to your YOLOv8 PT file
-MODEL_PATH = os.environ.get("YOLOV8_MODEL_PATH", "inferences/model/roboflow.pt")
+MODEL_PATH = os.environ.get("YOLOV8_MODEL_PATH", "inferences/model/roboflow-2.pt")
 
 # The class name to use for all detections
 DEFAULT_CLASS_NAME = "damage"
+CLASS_NAMES = ['corner', 'crack', 'damage', 'edge', 'knot', 'router', 'side', 'tearout']
 
 # Initialize the PyTorch model
 try:
     device = get_device()
     model = YOLO(MODEL_PATH)
     logger.info(f"Successfully loaded YOLOv8 model from {MODEL_PATH}")
-    
-    # Debug: Log model's class names if available
-    if hasattr(model, 'names'):
-        logger.info(f"Model has built-in class names: {model.names}")
-    
 except Exception as e:
     logger.error(f"Failed to load YOLOv8 model: {str(e)}")
     raise RuntimeError(f"Model initialization failed: {str(e)}")
@@ -107,18 +102,12 @@ def process_image(image_path):
     :return: JSON-serializable inference results
     """
     logger.info(f"Running inference on image {image_path}")
-    start_time = time.time()
     
-    # Get actual image dimensions
     img_width, img_height = get_image_dimensions(image_path)
     logger.info(f"Image dimensions: {img_width}x{img_height}")
     
     try:
-        # Run inference with YOLOv8
-        results = model(image_path, conf=0.4, iou=0.45)
-        
-        # Debug: Log more info about results
-        logger.info(f"Result type: {type(results)}, length: {len(results)}")
+        results = model(image_path, conf=0.1, iou=0.1)
         
         # Prepare serialized results
         serialized_results = {
@@ -130,23 +119,11 @@ def process_image(image_path):
         for result in results:
             boxes = result.boxes  # Boxes object for bbox outputs
             
-            # Debug: Check class information
-            if hasattr(result, 'names'):
-                logger.info(f"Result has class names: {result.names}")
-            
             for i, box in enumerate(boxes):
                 try:
                     # Get coordinates (comes as xyxy format)
                     xyxy = box.xyxy[0].tolist()  # get box coordinates in (x1, y1, x2, y2) format
                     conf = float(box.conf[0])    # confidence
-                    
-                    # Debug: Log class ID information
-                    if hasattr(box, 'cls'):
-                        cls_id = int(box.cls[0])
-                        logger.info(f"Detection {detection_id}: class_id={cls_id}")
-                        # Debug: If model has names, check what name it would assign
-                        if hasattr(model, 'names') and cls_id in model.names:
-                            logger.info(f"  Model would assign class: {model.names[cls_id]}")
                     
                     # Convert to xywh format (center, width, height)
                     x1, y1, x2, y2 = xyxy
@@ -160,8 +137,9 @@ def process_image(image_path):
                         logger.warning(f"Skipping detection with invalid dimensions: {width}x{height}")
                         continue
                     
-                    # Use default class name for all detections
-                    class_name = DEFAULT_CLASS_NAME
+                    # Use class name from the model if available
+                    cls_id = int(box.cls[0]) if hasattr(box, 'cls') else -1
+                    class_name = CLASS_NAMES[cls_id] if cls_id in range(len(CLASS_NAMES)) else DEFAULT_CLASS_NAME
                     
                     # Normalize coordinates with edge handling
                     bbox = normalize_coordinates(x, y, width, height, img_width, img_height)
@@ -183,7 +161,6 @@ def process_image(image_path):
                         'bbox': bbox
                     }
                     
-                    logger.debug(f"Processed prediction: {serialized_prediction}")
                     serialized_results["predictions"].append(serialized_prediction)
                     detection_id += 1
                     
@@ -191,8 +168,6 @@ def process_image(image_path):
                     logger.error(f"Error processing individual prediction: {str(e)}", exc_info=True)
                     continue
         
-        elapsed_time = time.time() - start_time
-        logger.info(f"Inference completed in {elapsed_time:.2f} seconds")
         return serialized_results
 
     except Exception as e:
