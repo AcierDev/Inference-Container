@@ -22,31 +22,16 @@ PROCESSED_DIR = BASE_STORAGE_DIR / 'processed'
 ARCHIVE_DIR = BASE_STORAGE_DIR / 'archive'
 ANNOTATED_DIR = PROCESSED_DIR / 'annotated'
 
-# Define category directories for defect types
-DEFECT_DIRS = {
-    'corner': PROCESSED_DIR / 'defect_types' / 'corner',
-    'crack': PROCESSED_DIR / 'defect_types' / 'crack',
-    'damage': PROCESSED_DIR / 'defect_types' / 'damage',
-    'edge': PROCESSED_DIR / 'defect_types' / 'edge',
-    'knot': PROCESSED_DIR / 'defect_types' / 'knot',
-    'router': PROCESSED_DIR / 'defect_types' / 'router',
-    'side': PROCESSED_DIR / 'defect_types' / 'side',
-    'tearout': PROCESSED_DIR / 'defect_types' / 'tearout',
-    'clean': PROCESSED_DIR / 'defect_types' / 'no_defects',
+# Define category directories for classification results
+CLASSIFICATION_DIRS = {
+    'Good': PROCESSED_DIR / 'classification' / 'good',
+    'Bad': PROCESSED_DIR / 'classification' / 'bad',
+    'Unknown': PROCESSED_DIR / 'classification' / 'unknown',
     'failed': PROCESSED_DIR / 'failed_processing'
 }
 
-# Define count-based directories
-COUNT_DIRS = {
-    '1-5': PROCESSED_DIR / 'count_based' / '01_to_05_defects',
-    '5-10': PROCESSED_DIR / 'count_based' / '05_to_10_defects',
-    '10-15': PROCESSED_DIR / 'count_based' / '10_to_15_defects',
-    '15-20': PROCESSED_DIR / 'count_based' / '15_to_20_defects',
-    '20+': PROCESSED_DIR / 'count_based' / '20_plus_defects'
-}
-
 # Ensure all directories exist
-for directory in [UPLOAD_DIR, PROCESSED_DIR, ARCHIVE_DIR, ANNOTATED_DIR, *DEFECT_DIRS.values(), *COUNT_DIRS.values()]:
+for directory in [UPLOAD_DIR, PROCESSED_DIR, ARCHIVE_DIR, ANNOTATED_DIR, *CLASSIFICATION_DIRS.values()]:
     directory.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
@@ -73,11 +58,11 @@ MAX_TASK_HISTORY = 100
 
 def create_annotated_image(image_path: Path, result: dict) -> Path:
     """
-    Create a copy of the image with bounding boxes and labels drawn.
+    Create a copy of the image with classification label
     
     Args:
         image_path (Path): Path to the original image
-        result (dict): Detection results containing predictions
+        result (dict): Classification results
         
     Returns:
         Path: Path to the annotated image
@@ -88,78 +73,50 @@ def create_annotated_image(image_path: Path, result: dict) -> Path:
     
     # Try to load a font, use default if not available
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 40)
     except:
         font = ImageFont.load_default()
     
-    # Generate distinct colors for each defect type
-    defect_types = {pred['class_name'] for pred in result.get('predictions', [])}
-    num_colors = max(len(defect_types), 1)
-    colors = {}
-    for i, defect_type in enumerate(defect_types):
-        # Generate evenly spaced hues
-        hue = i / num_colors
-        # Convert HSV to RGB (using full saturation and value)
-        rgb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-        # Convert to 8-bit RGB
-        colors[defect_type] = tuple(int(x * 255) for x in rgb)
-    
-    # Draw predictions
+    # Draw classification result
     width, height = img.size
-    for pred in result.get('predictions', []):
-        # Get normalized coordinates
-        bbox = pred['bbox']
-        x1, y1, x2, y2 = bbox
+    
+    # Check if we have any predictions
+    predictions = result.get('predictions', [])
+    if predictions:
+        prediction = predictions[0]
         
-        # Convert to pixel coordinates
-        x1 = int(x1 * width)
-        x2 = int(x2 * width)
-        y1 = int(y1 * height)
-        y2 = int(y2 * height)
+        # Get classification result and confidence
+        class_name = prediction.get('class_name', 'Unknown')
+        confidence = prediction.get('confidence', 0.0)
         
-        # Get defect type and confidence
-        defect_type = pred['class_name']
-        confidence = pred['confidence']
-        
-        # Get color for this defect type
-        color = colors.get(defect_type, (255, 255, 0))  # Yellow as default
-        
-        # Draw rectangle
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+        # Choose color based on classification result
+        if class_name == 'Bad':
+            color = (255, 0, 0)  # Red for bad
+        elif class_name == 'Good':
+            color = (0, 255, 0)  # Green for good
+        else:
+            color = (255, 255, 0)  # Yellow for unknown
         
         # Create label
-        label = f"{defect_type}: {confidence:.2f}"
+        label = f"{class_name}: {confidence:.2f}"
         
-        # Calculate label background size
+        # Draw a background box at the bottom of the image
         label_bbox = draw.textbbox((0, 0), label, font=font)
         label_width = label_bbox[2] - label_bbox[0]
         label_height = label_bbox[3] - label_bbox[1]
         
+        # Position the label at the top center
+        label_x = (width - label_width) // 2
+        label_y = 20
+        
         # Draw label background
-        label_x = x1
-        label_y = max(0, y1 - label_height - 5)
         draw.rectangle(
-            [label_x, label_y, label_x + label_width, label_y + label_height],
+            [label_x - 10, label_y - 10, label_x + label_width + 10, label_y + label_height + 10],
             fill=color
         )
         
         # Draw label text
         draw.text((label_x, label_y), label, fill='white', font=font)
-    
-    # Add summary text at the bottom
-    summary_text = f"Total defects: {len(result.get('predictions', []))}"
-    summary_bbox = draw.textbbox((0, 0), summary_text, font=font)
-    summary_width = summary_bbox[2] - summary_bbox[0]
-    summary_y = height - 30  # 30 pixels from bottom
-    
-    # Draw summary background
-    draw.rectangle(
-        [10, summary_y, 10 + summary_width + 10, summary_y + 25],
-        fill=(0, 0, 0)
-    )
-    
-    # Draw summary text
-    draw.text((15, summary_y), summary_text, fill='white', font=font)
     
     # Save annotated image
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -167,21 +124,6 @@ def create_annotated_image(image_path: Path, result: dict) -> Path:
     img.save(annotated_path, quality=95)
     
     return annotated_path
-
-def get_count_category(num_defects: int) -> str:
-    """Determine the count-based category for number of defects"""
-    if num_defects == 0:
-        return None
-    elif num_defects <= 5:
-        return '1-5'
-    elif num_defects <= 10:
-        return '5-10'
-    elif num_defects <= 15:
-        return '10-15'
-    elif num_defects <= 20:
-        return '15-20'
-    else:
-        return '20+'
 
 def copy_to_directory(src_path: Path, dest_dir: Path, suffix: str = "") -> Path:
     """Copy file to destination directory with optional suffix in filename"""
@@ -193,74 +135,69 @@ def copy_to_directory(src_path: Path, dest_dir: Path, suffix: str = "") -> Path:
 
 def organize_processed_image(file_path: Path, result: dict) -> dict:
     """
-    Organize the processed image by copying to all relevant category folders.
+    Organize the processed image by copying to the relevant classification folder.
     Returns dict with paths to all copies.
     """
     organized_paths = {
-        'defect_types': [],
-        'count_based': None,
+        'classification': None,
         'annotated': None,
         'original': file_path
     }
     
     try:
         predictions = result.get('predictions', [])
-        num_predictions = len(predictions)
         
-        # If there are any predictions, create annotated version
-        if num_predictions > 0:
-            organized_paths['annotated'] = create_annotated_image(file_path, result)
+        # Create annotated version with classification result
+        organized_paths['annotated'] = create_annotated_image(file_path, result)
         
-        # Get unique defect types
-        defect_types = set(pred['class_name'] for pred in predictions)
-        
-        if num_predictions == 0:
-            # Handle clean images
-            clean_path = copy_to_directory(
+        if not predictions:
+            # Handle images with no predictions
+            unknown_path = copy_to_directory(
                 file_path, 
-                DEFECT_DIRS['clean'], 
-                "_clean"
+                CLASSIFICATION_DIRS['Unknown'], 
+                "_unknown"
             )
-            organized_paths['defect_types'].append(clean_path)
+            organized_paths['classification'] = unknown_path
         else:
-            # Copy to each defect type directory
-            for defect_type in defect_types:
-                if defect_type in DEFECT_DIRS:
-                    type_specific_path = copy_to_directory(
-                        file_path,
-                        DEFECT_DIRS[defect_type],
-                        f"_{defect_type}_{num_predictions}defects"
-                    )
-                    organized_paths['defect_types'].append(type_specific_path)
+            # Get the first prediction (should be the only one for classification)
+            pred = predictions[0]
+            class_name = pred.get('class_name', 'Unknown')
+            confidence = pred.get('confidence', 0.0)
             
-            # Copy to count-based directory
-            count_category = get_count_category(num_predictions)
-            if count_category:
-                count_path = copy_to_directory(
-                    file_path,
-                    COUNT_DIRS[count_category],
-                    f"_{num_predictions}defects"
-                )
-                organized_paths['count_based'] = count_path
+            # Map class name to our known categories
+            if class_name not in CLASSIFICATION_DIRS:
+                class_name = 'Unknown'
+            
+            # Copy to appropriate classification directory
+            class_path = copy_to_directory(
+                file_path,
+                CLASSIFICATION_DIRS[class_name],
+                f"_{class_name}_{confidence:.2f}"
+            )
+            organized_paths['classification'] = class_path
         
         # Delete original upload after copying to all relevant directories
         file_path.unlink()
         
-        logger.info(f"Organized image into {len(organized_paths['defect_types']) + (1 if organized_paths['count_based'] else 0)} directories")
+        logger.info(f"Organized image into classification directory")
         
         return organized_paths
-        
+    
     except Exception as e:
-        logger.error(f"Error organizing file {file_path}: {str(e)}")
-        # Move to failed directory if organization fails
-        failed_path = DEFECT_DIRS['failed'] / file_path.name
-        shutil.move(str(file_path), str(failed_path))
-        return {
-            'defect_types': [failed_path], 
-            'count_based': None, 
-            'annotated': None, 
-            'original': file_path
-        }
+        logger.error(f"Error organizing processed image: {str(e)}", exc_info=True)
+        
+        # Try to save to failed processing directory if something goes wrong
+        try:
+            failed_path = copy_to_directory(
+                file_path,
+                CLASSIFICATION_DIRS['failed'],
+                "_failed"
+            )
+            organized_paths['classification'] = failed_path
+        except Exception as inner_e:
+            logger.error(f"Error copying to failed directory: {str(inner_e)}")
+        
+        return organized_paths
 
 def organize_processed_image_async(file_path: Path, result: dict, task_id: str):
     """
@@ -282,8 +219,7 @@ def organize_processed_image_async(file_path: Path, result: dict, task_id: str):
             "end_time": datetime.now().isoformat(),
             "success": True,
             "paths": {
-                "defect_types": [str(p) for p in organized_paths['defect_types']],
-                "count_based": str(organized_paths['count_based']) if organized_paths['count_based'] else None,
+                "classification": str(organized_paths['classification']) if organized_paths['classification'] else None,
                 "annotated": str(organized_paths['annotated']) if organized_paths['annotated'] else None
             }
         })
@@ -302,7 +238,7 @@ def organize_processed_image_async(file_path: Path, result: dict, task_id: str):
         
         # Move to failed directory if organization fails
         try:
-            failed_path = DEFECT_DIRS['failed'] / file_path.name
+            failed_path = CLASSIFICATION_DIRS['failed'] / file_path.name
             shutil.move(str(file_path), str(failed_path))
             background_tasks[task_id]["moved_to_failed"] = str(failed_path)
         except Exception as move_error:
@@ -315,8 +251,7 @@ def organize_processed_image_async(file_path: Path, result: dict, task_id: str):
 def health_check():
     """Health check endpoint"""
     storage_info = {
-        "defect_types": {k: str(v) for k, v in DEFECT_DIRS.items()},
-        "count_based": {k: str(v) for k, v in COUNT_DIRS.items()},
+        "classification": {k: str(v) for k, v in CLASSIFICATION_DIRS.items()},
         "base_dirs": {
             "upload": str(UPLOAD_DIR),
             "processed": str(PROCESSED_DIR),
@@ -403,7 +338,7 @@ def detect_imperfection():
                 logger.error(error_msg, exc_info=True)
                 
                 # Move to failed directory
-                failed_path = DEFECT_DIRS['failed'] / filename
+                failed_path = CLASSIFICATION_DIRS['failed'] / filename
                 shutil.move(str(upload_path), str(failed_path))
                 
                 return jsonify({
@@ -470,14 +405,11 @@ def cleanup_old_files(max_age_hours=24):
                     except Exception as e:
                         logger.error(f"Error removing old upload {file_path}: {str(e)}")
         
-        # Archive old files from defect type directories
-        archive_old_files(PROCESSED_DIR / 'defect_types')
-        
-        # Archive old files from count-based directories
-        archive_old_files(PROCESSED_DIR / 'count_based')
+        # Archive old files from classification directory
+        archive_old_files(PROCESSED_DIR / 'classification')
         
         # Archive old files from failed processing directory
-        archive_old_files(DEFECT_DIRS['failed'])
+        archive_old_files(CLASSIFICATION_DIRS['failed'])
         
     except Exception as e:
         logger.error(f"Error during cleanup: {str(e)}")
